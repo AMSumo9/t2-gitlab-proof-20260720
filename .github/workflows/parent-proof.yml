@@ -1,0 +1,17 @@
+name: Parent deploy proof
+
+on: {workflow_dispatch: {}}
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      T2_REPO_FULL: ${{ github.repository }}
+      T2_REPO_NAME: ${{ github.event.repository.name }}
+      GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash .github/scripts/deploy-writeback.sh
