@@ -418,7 +418,7 @@ jobs:
           done
           [ -n "$URL" ] || { echo "::error::GitLab Pages URL was not assigned"; exit 1; }
           curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_PAT" -H "Content-Type: application/json" \
-            --data '{"visibility":"public","pages_access_level":"public"}' \
+            --data '{"visibility":"public","pages_access_level":"enabled"}' \
             "$API/projects/$PROJECT_ID" >/dev/null
           echo "resolved_url=${URL%/}/" >> "$GITHUB_OUTPUT"
 
