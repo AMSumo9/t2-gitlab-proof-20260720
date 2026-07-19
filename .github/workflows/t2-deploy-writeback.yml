@@ -1,0 +1,666 @@
+name: t2-deploy-writeback
+
+# Fires after Hermes commits+pushes a built T2 feeder site (raw HTML at repo
+# root). THIS ACTION DEPLOYS IT -- Hermes holds no host credentials, only a
+# git-write SSH key (blast radius = git-write only if the VPS is compromised).
+# Host creds live in this repo's Action secrets. After deploy, polls for a
+# real HTTP 200, then does the DB writeback. NEVER writes DB before a
+# confirmed-live check (evidence gate — see docs/system/t2plus-automation-spec.md
+# §6.0, 2026-07-01 bake-off finding: a free model called wheel-done having
+# built nothing).
+#
+# Expects at repo root, written by Hermes at build/commit time:
+#   .wheel-meta.json  — { wheel_id, slug, project, parent_t1_ref, money_target,
+#                          primary_kw, intended_url,
+#                          links: [{ target_url, anchor, rel }, ...] }
+#     project = the pretty subdomain/site name (e.g. "garage-door-repair-guide"
+#     for garage-door-repair-guide.netlify.app) -- intended_url MUST match what
+#     that project name resolves to on the target host.
+#   .deploy-host      — plain text, one of: netlify | vercel | s3 | cloudflare | ghpages | surge | render | digitalocean | neocities | firebase | gitlab
+#     (gcs is NOT wired -- blocked by a GCP org policy that disallows service-account
+#     key creation; would need Workload Identity Federation instead, not built. Do
+#     not route a node to gcs until that's done.)
+#   <32-hex>.txt      — the IndexNow key file (same convention as the local
+#     deploy-cloud.sh pipeline: filename IS the key, content IS the key, must
+#     be reachable at <live-url-host>/<key>.txt). Reuse the same key across a
+#     node's redeploys if one already exists; generate fresh only for a new
+#     node. WITHOUT this file the Action skips IndexNow submission silently
+#     (logged, not a failure) -- Bing/Yandex/DuckDuckGo will not get pinged.
+#     s3/gcs (path hosts) never got IndexNow even in the old pipeline -- RapidURL only.
+#
+# Host secrets required per repo (pushed once at repo-create time), all now pushed
+# to every sitesau cloudsite repo (2026-07-02):
+#   netlify    -> NETLIFY_AUTH_TOKEN
+#   vercel     -> VERCEL_TOKEN
+#   s3         -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+#   cloudflare -> CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (mambaqld account)
+#   ghpages    -> none beyond the Action's own GITHUB_TOKEN (native GH Pages on
+#                 THIS repo, enabled via API on first deploy, idempotent)
+#   surge      -> SURGE_LOGIN, SURGE_TOKEN
+#   render     -> RENDER_API_KEY
+#   digitalocean -> DIGITAL_OCEAN_API_KEY
+#   neocities  -> NEOCITIES_API_KEY (PATH host, shared 'aumedia' sitename, subpath per property)
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  writeback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # ghpages deploy step pushes a gh-pages branch to THIS repo
+      pages: write     # ghpages deploy step enables Pages via the API on this repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read wheel meta
+        id: meta
+        run: |
+          # Not every push to this repo is a Hermes T2 build (content tweaks,
+          # manual fixes, etc). No .wheel-meta.json -> clean no-op, not a
+          # failure -- otherwise every unrelated push spams a failure email.
+          if [ ! -f .wheel-meta.json ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No .wheel-meta.json on this push -- not a Hermes T2 build, skipping writeback."
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "wheel_id=$(jq -r '.wheel_id' .wheel-meta.json)"
+            echo "slug=$(jq -r '.slug' .wheel-meta.json)"
+            echo "project=$(jq -r '.project // .slug' .wheel-meta.json)"
+            echo "parent_t1_ref=$(jq -r '.parent_t1_ref' .wheel-meta.json)"
+            echo "money_target=$(jq -r '.money_target // ""' .wheel-meta.json)"
+            echo "primary_kw=$(jq -r '.primary_kw // ""' .wheel-meta.json)"
+            echo "intended_url=$(jq -r '.intended_url' .wheel-meta.json)"
+            printf 'node_role=%s\n' "$(jq -r '.node_role // "feeder"' .wheel-meta.json)"
+          } >> "$GITHUB_OUTPUT"
+          echo "cloud_host=$(cat .deploy-host | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+          jq -c '.links // []' .wheel-meta.json > /tmp/links.json
+
+      - name: Deploy (netlify)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'netlify'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          npm install -g netlify-cli
+          PROJECT="${{ steps.meta.outputs.project }}"
+          SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
+          if [ -z "$SID" ]; then
+            netlify sites:create --name "$PROJECT" --account-slug sites-au
+            SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
+          fi
+          [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT' in account sites-au"; exit 1; }
+          netlify deploy --prod --dir=. --site="$SID"
+
+      - name: Deploy (vercel)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'vercel'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          npm install -g vercel
+          PROJECT="${{ steps.meta.outputs.project }}"
+          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --scope=site-au --name="$PROJECT" | tail -1 | tr -d '\r')"
+          [ -n "$DEP_URL" ] || { echo "::error::vercel deploy produced no URL for '$PROJECT' in scope site-au"; exit 1; }
+          vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN" --scope=site-au
+
+      - name: Deploy (s3)
+        # Bucket = project name (mirrors _scripts/deploy_s3.py convention).
+        # Public-read via bucket policy; served at the virtual-hosted object
+        # URL (https://<bucket>.s3.<region>.amazonaws.com/<key>).
+        # Uses Python/boto3, NOT the `aws` CLI binary (proven working locally
+        # with the same creds; CLI showed the identical error, so this wasn't
+        # a CLI-vs-boto3 issue).
+        # ROOT CAUSE FOUND 2026-07-02 (confirmed via a throwaway workflow_dispatch
+        # diagnostic job -- deleted after use): NameResolutionError hit ANY
+        # *.amazonaws.com hostname (bucket-subdomain AND plain regional), not
+        # a bucket/addressing-style problem. The diagnostic job (fresh runner)
+        # resolved + curled the exact same hostnames instantly with no issue,
+        # AWS_DEFAULT_REGION/AWS_ACCESS_KEY_ID secret values are clean (no
+        # whitespace, correct length). A `sudo` resolv.conf override was tried
+        # and made things worse (15-min hang, reverted). STILL UNRESOLVED as
+        # of 2026-07-02: 3 separate real pushes (3 separate fresh GH-hosted
+        # VMs, by design) all hit the identical NameResolutionError against
+        # *.amazonaws.com for the FULL duration of nested retries (botocore's
+        # own 10-attempt standard-mode backoff stacked with the manual loop
+        # below produced 10-15 min per failed attempt), while unrelated
+        # domains (PyPI, GitHub, Supabase) resolved fine on those same runs.
+        # Looks like intermittent GH-Actions-egress-vs-AWS-S3 connectivity
+        # trouble outside this repo's control, not a config/code bug -- but
+        # not proven beyond doubt. Retry budget trimmed way down here (was
+        # tying up the job for 10+ min per failed attempt) so a bad run fails
+        # FAST instead; t2_build_queue rows land in status=failed on any
+        # failure and are safe to re-queue for another attempt (fresh VM)
+        # rather than fighting a possibly-permanently-bad single VM in place.
+        # Do not re-attempt a fix here without new evidence -- next step if
+        # this keeps failing is to open a GH Support ticket citing runner
+        # network health, since local/diagnostic-job connectivity is proven
+        # fine and this is not something the workflow itself can control.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          PROJECT: ${{ steps.meta.outputs.project }}
+        run: |
+          pip install -q boto3
+          python3 - <<'PYEOF'
+          import os, glob, time, boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError, EndpointConnectionError
+
+          project = os.environ["PROJECT"]
+          region = os.environ["AWS_DEFAULT_REGION"]
+          cfg = Config(signature_version="s3v4", retries={"max_attempts": 2, "mode": "standard"},
+                       s3={"addressing_style": "path"}, connect_timeout=8, read_timeout=15)
+          s3 = boto3.client("s3", region_name=region, config=cfg)
+
+          def with_retry(fn, *args, attempts=2, delay=3, **kwargs):
+              last_err = None
+              for i in range(attempts):
+                  try:
+                      return fn(*args, **kwargs)
+                  except EndpointConnectionError as e:
+                      last_err = e
+                      print(f"  retry {i+1}/{attempts} after connection error: {e}")
+                      time.sleep(delay)
+              raise last_err
+
+          # Always (re-)apply public-access-block + bucket policy, not just on
+          # first creation -- a bucket can already exist (e.g. from an earlier
+          # partial/failed run) without the policy applied, which silently
+          # uploads into a PRIVATE bucket (403 AccessDenied on the live URL,
+          # found 2026-07-02 on bathroomrenovationcamberwell-101). Both calls
+          # are idempotent, safe to run unconditionally every deploy.
+          try:
+              with_retry(s3.head_bucket, Bucket=project)
+          except ClientError:
+              with_retry(s3.create_bucket, Bucket=project, CreateBucketConfiguration={"LocationConstraint": region})
+
+          with_retry(s3.put_public_access_block, Bucket=project, PublicAccessBlockConfiguration={
+              "BlockPublicAcls": False, "IgnorePublicAcls": False,
+              "BlockPublicPolicy": False, "RestrictPublicBuckets": False,
+          })
+          with_retry(s3.put_bucket_policy, Bucket=project, Policy=(
+              '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow",'
+              '"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' % project
+          ))
+
+          # Path host convention: the built HTML file is keyword-named (e.g.
+          # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html.
+          for f in glob.glob("*.html"):
+              with_retry(s3.upload_file, f, project, f, ExtraArgs={"ContentType": "text/html"})
+          for pattern in ("*.jpg", "*.png", "*.txt", "*.xml"):
+              for f in glob.glob(pattern):
+                  if f.startswith("."):
+                      continue
+                  try:
+                      with_retry(s3.upload_file, f, project, f)
+                  except Exception:
+                      pass
+          print(f"S3 deploy complete: bucket={project}")
+          PYEOF
+
+      - name: Deploy (surge)
+        # Own-host (like netlify/vercel): serves every file in the dir at
+        # root, IndexNow applies. Proven live 2026-07-02 via deploy-cloud.sh's
+        # existing surge branch, ported here 1:1 -- non-interactive via
+        # SURGE_LOGIN/SURGE_TOKEN env vars (surge would otherwise drop into
+        # an interactive login prompt and hang the runner).
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'surge'
+        env:
+          SURGE_LOGIN: ${{ secrets.SURGE_LOGIN }}
+          SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
+        run: |
+          [ -n "$SURGE_LOGIN" ] && [ -n "$SURGE_TOKEN" ] || { echo "::error::SURGE_LOGIN/SURGE_TOKEN missing"; exit 1; }
+          npm install -g surge >/dev/null
+          PROJECT="${{ steps.meta.outputs.project }}"
+          HOST="$PROJECT.surge.sh"
+          cp index.html 200.html 2>/dev/null || true
+          surge . "$HOST"
+
+      - name: Deploy (render)
+        # Render can build straight from THIS repo (already public under
+        # sitesau, content already committed here) -- no need for the local
+        # deploy-render.sh's "publish to a second standalone repo" step,
+        # that only exists locally because the local pipeline builds outside
+        # any git repo first. Own-host, root, IndexNow applies. Proven live
+        # 2026-07-02 via the local script; ported + simplified here.
+        # Render may truncate the service slug/URL when the project name is
+        # long, so resolve serviceDetails.url and use that for the evidence gate.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'render'
+        id: deploy_render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+        run: |
+          [ -n "$RENDER_API_KEY" ] || { echo "::error::RENDER_API_KEY missing"; exit 1; }
+          PROJECT="${{ steps.meta.outputs.project }}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+          FALLBACK_URL="https://${PROJECT}.onrender.com/"
+          SVCID="$(curl -s -m 25 -H "Authorization: Bearer $RENDER_API_KEY" \
+            "https://api.render.com/v1/services?name=$PROJECT&type=static_site&limit=1" \
+            | jq -r '.[0].service.id // empty')"
+          if [ -z "$SVCID" ]; then
+            OWNER_ID="${RENDER_OWNER_ID:-}"
+            if [ -z "$OWNER_ID" ]; then
+              OWNER_ID="$(curl -s -m 25 -H "Authorization: Bearer $RENDER_API_KEY" \
+                "https://api.render.com/v1/services?limit=1" \
+                | jq -r '.[0].service.ownerId // .[0].service.owner.id // .[0].ownerId // .[0].owner.id // empty')"
+            fi
+            [ -n "$OWNER_ID" ] || { echo "::error::Render ownerId unavailable; set RENDER_OWNER_ID secret"; exit 1; }
+            RESP="$(jq -n \
+              --arg name "$PROJECT" \
+              --arg ownerId "$OWNER_ID" \
+              --arg repo "$REPO_URL" \
+              '{type:"static_site",name:$name,ownerId:$ownerId,repo:$repo,branch:"main",autoDeploy:"yes",serviceDetails:{buildCommand:"",publishPath:"."}}' \
+              | curl -s -m 40 -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+                -H "Content-Type: application/json" "https://api.render.com/v1/services" --data @-)"
+            SVCID="$(echo "$RESP" | jq -r '(.service.id // .id) // empty')"
+            [ -n "$SVCID" ] || { echo "::error::Render create failed: $(echo "$RESP" | head -c 300)"; exit 1; }
+          else
+            curl -s -m 25 -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SVCID/deploys" -d '{}' >/dev/null 2>&1 || true
+          fi
+          echo "render_service_id=$SVCID" >> "$GITHUB_OUTPUT" 2>/dev/null || true
+          RESOLVED=""
+          for i in {1..24}; do
+            RESOLVED="$(curl -s -m 25 -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SVCID" \
+              | jq -r '.service.serviceDetails.url // .service.url // empty')"
+            [ -n "$RESOLVED" ] && break
+            sleep 5
+          done
+          if [ -z "$RESOLVED" ]; then
+            RESOLVED="$FALLBACK_URL"
+            echo "::warning::Render service URL unavailable for '$PROJECT'; falling back to $RESOLVED"
+          fi
+          echo "resolved_url=${RESOLVED%/}/" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (digitalocean)
+        # Same simplification as Render: DO App Platform builds straight from
+        # THIS repo (already public, content already committed) -- no second
+        # standalone repo needed. Own-host root, IndexNow applies. Proven
+        # live 2026-07-02 via the local script; ported + simplified here.
+        # NOTE: unlike every other host, DO's live URL is NOT predictable
+        # from the project name (random suffix, e.g. do-host-probe-h7zoq.
+        # ondigitalocean.app) -- .wheel-meta.json's intended_url cannot be
+        # right for this host. Resolve the real URL here and export it; the
+        # evidence-gate poll step below uses it instead of intended_url.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'digitalocean'
+        id: deploy_do
+        env:
+          DIGITAL_OCEAN_API_KEY: ${{ secrets.DIGITAL_OCEAN_API_KEY }}
+        run: |
+          [ -n "$DIGITAL_OCEAN_API_KEY" ] || { echo "::error::DIGITAL_OCEAN_API_KEY missing"; exit 1; }
+          PROJECT="${{ steps.meta.outputs.project }}"
+          REPO_URL="https://github.com/${{ github.repository }}.git"
+          APPNAME="$(printf '%s' "$PROJECT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g' | cut -c1-30)"
+          APPID="$(curl -s -m 25 -H "Authorization: Bearer $DIGITAL_OCEAN_API_KEY" \
+            "https://api.digitalocean.com/v2/apps?per_page=200" \
+            | jq -r --arg n "$APPNAME" '.apps[] | select(.spec.name==$n) | .id' | head -1)"
+          SPEC_TMP="$(mktemp)"
+          jq -n --arg name "$APPNAME" --arg repo "$REPO_URL" \
+            '{spec:{name:$name,static_sites:[{name:"site",git:{repo_clone_url:$repo,branch:"main"},source_dir:"/",output_dir:"/"}]}}' \
+            > "$SPEC_TMP"
+          if [ -z "$APPID" ]; then
+            RESP="$(curl -s -m 40 -X POST -H "Authorization: Bearer $DIGITAL_OCEAN_API_KEY" \
+              -H "Content-Type: application/json" "https://api.digitalocean.com/v2/apps" --data @"$SPEC_TMP")"
+            APPID="$(echo "$RESP" | jq -r '.app.id // empty')"
+            [ -n "$APPID" ] || { echo "::error::DO app create failed: $(echo "$RESP" | head -c 300)"; rm -f "$SPEC_TMP"; exit 1; }
+          else
+            curl -s -m 40 -X PUT -H "Authorization: Bearer $DIGITAL_OCEAN_API_KEY" \
+              -H "Content-Type: application/json" "https://api.digitalocean.com/v2/apps/$APPID" --data @"$SPEC_TMP" >/dev/null 2>&1 || true
+          fi
+          rm -f "$SPEC_TMP"
+          echo "do_app_id=$APPID" >> "$GITHUB_OUTPUT"
+          RESOLVED=""
+          for i in $(seq 1 12); do
+            sleep 15
+            RESOLVED="$(curl -s -m 25 -H "Authorization: Bearer $DIGITAL_OCEAN_API_KEY" \
+              "https://api.digitalocean.com/v2/apps/$APPID" | jq -r '.app.live_url // .app.default_ingress // empty')"
+            [ -n "$RESOLVED" ] && break
+          done
+          [ -n "$RESOLVED" ] || { echo "::error::DO app never reported a live_url after 3min"; exit 1; }
+          echo "resolved_url=${RESOLVED%/}/" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (neocities)
+        # PATH host, like s3/gcs: free plan = ONE sitename per account
+        # ('aumedia'), so every property lives as a subdirectory
+        # (aumedia.neocities.org/<project>/), not a distinct subdomain.
+        # No per-subpath robots/sitemap (ineffective at the shared root) --
+        # ship keyword html + llms + inline JSON-LD, index via Rapid not
+        # IndexNow-per-property (the IndexNow key IS reachable at the shared
+        # account root though, so it's still submitted here). Proven live
+        # 2026-07-02 via the local deploy-neocities.sh script; ported 1:1.
+        # Hermes must set intended_url to https://aumedia.neocities.org/
+        # <project>/<kw-slug-file> in .wheel-meta.json for this host --
+        # sitename is fixed/known ('aumedia'), unlike digitalocean's random
+        # suffix, so it IS derivable in advance.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'neocities'
+        env:
+          NEOCITIES_API_KEY: ${{ secrets.NEOCITIES_API_KEY }}
+        run: |
+          [ -n "$NEOCITIES_API_KEY" ] || { echo "::error::NEOCITIES_API_KEY missing"; exit 1; }
+          PROJECT="${{ steps.meta.outputs.project }}"
+          UP_ARGS=()
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in .*|.wheel-meta.json|.deploy-host) continue;; esac
+            UP_ARGS+=(-F "$PROJECT/$f=@$f")
+          done
+          KEY_FILE="$(ls *.txt 2>/dev/null | grep -iE '^[0-9a-f]{32}\.txt$' | head -1 || true)"
+          if [ -n "$KEY_FILE" ]; then
+            UP_ARGS+=(-F "$KEY_FILE=@$KEY_FILE")
+          fi
+          RESP="$(curl -s -m 60 -H "Authorization: Bearer $NEOCITIES_API_KEY" "${UP_ARGS[@]}" "https://neocities.org/api/upload")"
+          echo "$RESP" | grep -q '"result": *"success"' || { echo "::error::Neocities upload failed: $RESP"; exit 1; }
+
+      - name: Deploy (gitlab)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'gitlab'
+        id: deploy_gitlab
+        env:
+          GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
+        run: |
+          [ -n "$GITLAB_PAT" ] || { echo "::error::GITLAB_PAT missing"; exit 1; }
+          PROJECT="${{ steps.meta.outputs.project }}"
+          NAMESPACE="sites_26"
+          NAMESPACE_ID="137785918"
+          API="https://gitlab.com/api/v4"
+          ENCODED_PATH="$(jq -rn --arg v "$NAMESPACE/$PROJECT" '$v|@uri')"
+          PROJECT_JSON="$(curl -sf -H "PRIVATE-TOKEN: $GITLAB_PAT" "$API/projects/$ENCODED_PATH" || true)"
+          PROJECT_ID="$(printf '%s' "$PROJECT_JSON" | jq -r '.id // empty')"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_JSON="$(curl -sf -X POST -H "PRIVATE-TOKEN: $GITLAB_PAT" \
+              --data-urlencode "name=$PROJECT" --data-urlencode "path=$PROJECT" \
+              --data-urlencode "namespace_id=$NAMESPACE_ID" --data-urlencode "visibility=public" \
+              "$API/projects")"
+            PROJECT_ID="$(printf '%s' "$PROJECT_JSON" | jq -r '.id // empty')"
+          fi
+          [ -n "$PROJECT_ID" ] || { echo "::error::GitLab project create/lookup failed"; exit 1; }
+          curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_PAT" \
+            --data-urlencode "visibility=public" --data-urlencode "pages_access_level=public" \
+            "$API/projects/$PROJECT_ID" >/dev/null
+
+          STAGE="$(mktemp -d)"
+          rsync -a --exclude='.git' --exclude='.github' ./ "$STAGE/"
+          cat > "$STAGE/.gitlab-ci.yml" <<'YML'
+pages:
+  stage: deploy
+  script:
+    - rm -rf public
+    - mkdir -p public
+    - |
+      find . -mindepth 1 -maxdepth 1 \
+        ! -name '.git' ! -name 'public' ! -name '.gitlab-ci.yml' \
+        -exec cp -a {} public/ \;
+    - rm -rf public/.git public/public
+  artifacts:
+    paths: [public]
+  only: [main]
+YML
+          cd "$STAGE"
+          git init -q -b main
+          git config user.email "codex-t2@sitesau.local"
+          git config user.name "codex-t2"
+          git add -A
+          git commit -q -m "publish $PROJECT"
+          git remote add origin "https://oauth2:${GITLAB_PAT}@gitlab.com/${NAMESPACE}/${PROJECT}.git"
+          git push -q --force origin main
+
+          URL=""
+          for _ in $(seq 1 20); do
+            sleep 15
+            URL="$(curl -sf -H "PRIVATE-TOKEN: $GITLAB_PAT" "$API/projects/$PROJECT_ID/pages" | jq -r '.url // empty' || true)"
+            [ -n "$URL" ] && break
+          done
+          [ -n "$URL" ] || { echo "::error::GitLab Pages URL was not assigned"; exit 1; }
+          echo "resolved_url=${URL%/}/" >> "$GITHUB_OUTPUT"
+
+      - name: Publish into Firebase T2 path repository
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'firebase'
+        env:
+          AMSUMO_GITHUB_TOKEN: ${{ secrets.AMSUMO_GITHUB_TOKEN }}
+        run: |
+          [ -n "$AMSUMO_GITHUB_TOKEN" ] || { echo "::error::AMSUMO_GITHUB_TOKEN missing"; exit 1; }
+          SLUG="${{ steps.meta.outputs.slug }}"
+          AGG="$(mktemp -d)"
+          git clone -q "https://x-access-token:${AMSUMO_GITHUB_TOKEN}@github.com/AMSumo9/firebase-t2-cloudsites.git" "$AGG"
+          mkdir -p "$AGG/public/$SLUG"
+          rsync -a --delete --exclude='.git' --exclude='.github' \
+            --exclude='.wheel-meta.json' --exclude='.deploy-host' ./ "$AGG/public/$SLUG/"
+          KEY_FILE="$(find . -maxdepth 1 -type f -regextype posix-extended -regex './[0-9a-f]{32}\.txt' | head -1 || true)"
+          [ -z "$KEY_FILE" ] || cp "$KEY_FILE" "$AGG/public/"
+          cd "$AGG"
+          git config user.email "codex-t2@sitesau.local"
+          git config user.name "codex-t2"
+          git add -A
+          git commit -q -m "publish firebase path $SLUG" || true
+          pushed=0
+          for _ in $(seq 1 5); do
+            if git push -q origin HEAD:main; then pushed=1; break; fi
+            git pull -q --rebase origin main
+          done
+          [ "$pushed" = 1 ] || { echo "::error::Could not update Firebase T2 aggregator"; exit 1; }
+
+      - name: Deploy (cloudflare pages)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'cloudflare'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm install -g wrangler
+          PROJECT="${{ steps.meta.outputs.project }}"
+          npx wrangler pages project create "$PROJECT" --production-branch=main || true
+          npx wrangler pages deploy . --project-name="$PROJECT" --branch=main --commit-dirty=true
+
+      - name: Deploy (github pages)
+        # Native GH Pages on THIS repo (no external host account needed). Enables
+        # Pages via the API (idempotent) then pushes content to a gh-pages branch.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'ghpages'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The default Actions token cannot manage Pages settings even with
+          # `pages: write` declared (confirmed: 403 on the enable-Pages call
+          # despite the permission being granted -- a known GH limitation,
+          # Pages admin needs a real PAT). CLOUDSITES_PAT is the classic
+          # sitesau PAT (repo scope) pushed alongside the other secrets.
+          CLOUDSITES_PAT: ${{ secrets.CLOUDSITES_PAT }}
+        run: |
+          # The gh-pages branch must exist BEFORE Pages can be enabled to source
+          # from it -- push the branch first, enable second.
+          rm -rf /tmp/ghpages-deploy && mkdir /tmp/ghpages-deploy
+          cp -r ./* /tmp/ghpages-deploy/ 2>/dev/null
+          rm -rf /tmp/ghpages-deploy/.git
+          cd /tmp/ghpages-deploy
+          git init -q -b gh-pages
+          git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local add -A
+          git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local commit -q -m "deploy"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages:gh-pages
+          PAGES_TOKEN="${CLOUDSITES_PAT:-$GH_TOKEN}"
+          curl -s -w '\nHTTP=%{http_code}\n' -X POST "https://api.github.com/repos/${{ github.repository }}/pages" \
+            -H "Authorization: Bearer $PAGES_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d '{"source":{"branch":"gh-pages","path":"/"}}'
+
+      - name: Deploy (gcs -- blocked, org policy)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'gcs'
+        run: |
+          echo "::error::cloud_host=gcs is blocked -- GCP org policy disallows service-account key creation. Needs Workload Identity Federation instead (not built). Do not route T2 builds to gcs until this is fixed."
+          exit 1
+
+      - name: Poll live URL for HTTP 200 (evidence gate)
+        if: steps.meta.outputs.present == 'true'
+        id: verify
+        run: |
+          # Some hosts resolve the final URL only after the deploy step. Use
+          # that evidence URL instead of the planned intended_url.
+          if [ "${{ steps.meta.outputs.cloud_host }}" = "digitalocean" ]; then
+            url="${{ steps.deploy_do.outputs.resolved_url }}"
+          elif [ "${{ steps.meta.outputs.cloud_host }}" = "render" ]; then
+            url="${{ steps.deploy_render.outputs.resolved_url }}"
+          elif [ "${{ steps.meta.outputs.cloud_host }}" = "gitlab" ]; then
+            url="${{ steps.deploy_gitlab.outputs.resolved_url }}"
+          else
+            url="${{ steps.meta.outputs.intended_url }}"
+          fi
+          code=0
+          attempts=20
+          sleep_secs=15
+          if [ "${{ steps.meta.outputs.cloud_host }}" = "render" ]; then
+            attempts=30
+          fi
+          for i in $(seq 1 "$attempts"); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+              if [ "${{ steps.meta.outputs.cloud_host }}" = "firebase" ] || [ "${{ steps.meta.outputs.cloud_host }}" = "gitlab" ]; then
+                # New hosts enter rotation only after a direct public 200,
+                # indexability checks, and dofollow upward-link verification.
+                direct_code="$(curl -sS -D /tmp/live-headers -o /tmp/live-body -w '%{http_code}' "$url")"
+                [ "$direct_code" = "200" ] || { echo "::error::Direct public URL returned $direct_code (redirect/auth not allowed)"; exit 1; }
+                ! grep -qiE '^x-robots-tag:.*noindex' /tmp/live-headers || { echo "::error::X-Robots-Tag blocks indexing"; exit 1; }
+                ! grep -qiE '<meta[^>]+name=["'"']robots["'"'][^>]+content=["'"'][^"'"']*noindex' /tmp/live-body || { echo "::error::meta robots blocks indexing"; exit 1; }
+                python3 - <<'PY'
+          import json
+          from html.parser import HTMLParser
+
+          expected = {item["target_url"] for item in json.load(open("/tmp/links.json", encoding="utf-8"))}
+
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.follow = set()
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() != "a":
+                      return
+                  values = {key.lower(): value or "" for key, value in attrs}
+                  rel = {part.lower() for part in values.get("rel", "").split()}
+                  if values.get("href") and "nofollow" not in rel:
+                      self.follow.add(values["href"])
+
+          parser = Links()
+          parser.feed(open("/tmp/live-body", encoding="utf-8", errors="replace").read())
+          missing = sorted(expected - parser.follow)
+          if missing:
+              raise SystemExit(f"missing dofollow upward links: {missing}")
+          PY
+              fi
+              echo "live_url=$url" >> "$GITHUB_OUTPUT"
+              echo "http_code=$code" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep "$sleep_secs"
+          done
+          echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: IndexNow submit (Bing/Yandex/DuckDuckGo, free)
+        # Mirrors deploy-cloud.sh's convention: a 32-hex-named .txt file at
+        # repo root IS the IndexNow key (must be reachable at <host>/<key>.txt).
+        # Hermes must commit this file alongside the built HTML -- if it's
+        # missing, submission is skipped (logged, not a failure) rather than
+        # generating+committing a key mid-Action.
+        if: steps.meta.outputs.present == 'true' && success()
+        run: |
+          KEY_FILE="$(ls *.txt 2>/dev/null | grep -iE '^[0-9a-f]{32}\.txt$' | head -1 || true)"
+          if [ -z "$KEY_FILE" ]; then
+            echo "No IndexNow key .txt at repo root -- skipping submission. Hermes should commit one (see t2-deploy-writeback.yml header)."
+            exit 0
+          fi
+          KEY="$(basename "$KEY_FILE" .txt)"
+          url="${{ steps.verify.outputs.live_url }}"
+          host="$(echo "$url" | sed -E 's#https?://([^/]+).*#\1#')"
+          for ep in https://api.indexnow.org/indexnow https://www.bing.com/indexnow https://yandex.com/indexnow; do
+            curl -s -o /dev/null -m 20 "$ep?url=$url&key=$KEY&keyLocation=https://$host/$KEY.txt" || true
+          done
+          echo "IndexNow submitted for $url"
+
+      - name: Writeback (live confirmed)
+        if: steps.meta.outputs.present == 'true' && success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          slug="${{ steps.meta.outputs.slug }}"
+          parent="${{ steps.meta.outputs.parent_t1_ref }}"
+          money="${{ steps.meta.outputs.money_target }}"
+          kw="${{ steps.meta.outputs.primary_kw }}"
+          host="${{ steps.meta.outputs.cloud_host }}"
+          live_url="${{ steps.verify.outputs.live_url }}"
+          wheel_id="${{ steps.meta.outputs.wheel_id }}"
+          rest="$SUPABASE_URL/rest/v1"
+          # deploy.* tables live outside PostgREST's default 'public' schema —
+          # Accept-Profile (GET/DELETE) / Content-Profile (POST/PATCH) select it.
+          # --retry: this step saw intermittent transient connection failures
+          # (exit 6 / exit 22) on brand-new repos during testing 2026-07-02 --
+          # the exact same calls succeed instantly when run outside the GH
+          # runner, so it's runner-side network flakiness, not a logic bug.
+          # curl's own retry covers it without a custom wrapper.
+          RETRY=(--retry 4 --retry-delay 3 --retry-all-errors)
+          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" -H "Accept-Profile: deploy" -H "Content-Profile: deploy")
+
+          # 1. cloud_properties upsert (tier=T2, links_up_to=parent T1, never money)
+          curl -sf "${RETRY[@]}" -X POST "$rest/cloud_properties" \
+            "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+            -d @- <<JSON
+          {"slug":"$slug","money_target":"$money","cloud_host":"$host","intended_url":"$live_url",
+           "live_url":"$live_url","primary_kw":"$kw","tier":"T2","links_up_to":"$parent",
+           "method":"cloudlink-t2-wheel","status":"live"}
+          JSON
+
+          # 2. link_edges feed-replace (source_feed=t2-wheel, this slug only)
+          curl -sf "${RETRY[@]}" -X DELETE "$rest/link_edges?source_ref=eq.$slug&source_feed=eq.t2-wheel" "${auth[@]}"
+
+          # Dedup by (source_url, target_url) before upsert -- a node with 2+
+          # anchors to the same target (normal T2 prose) produces duplicate
+          # conflict keys in one batch, which Postgres rejects (21000: "ON
+          # CONFLICT DO UPDATE command cannot affect row a second time") and
+          # fails the WHOLE writeback after cloud_properties already wrote.
+          # Found 2026-07-02 proving the first real multi-feeder wheel.
+          jq -c --arg slug "$slug" --arg url "$live_url" \
+            '[.[] | {source_url:$url, target_url:.target_url, source_type:"cloud", source_ref:$slug, target_type:"cloud", anchor:.anchor, rel:(.rel // "follow"), source_feed:"t2-wheel", first_seen: (now|strftime("%Y-%m-%d"))}]
+             | unique_by([.source_url, .target_url])' \
+            /tmp/links.json > /tmp/link_edges.json
+
+          if [ "$(jq 'length' /tmp/link_edges.json)" -gt 0 ]; then
+            curl -sf "${RETRY[@]}" -X POST "$rest/link_edges" "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+              -d @/tmp/link_edges.json
+          fi
+
+          # 3. t2_build_queue: append feeder slugs to built_slugs, flip done only
+          #    once feeder_count is met (structure may need multiple pushes).
+          row=$(curl -sf "${RETRY[@]}" "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
+          feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
+          node_role="${{ steps.meta.outputs.node_role }}"
+          if [ "$node_role" = "feeder" ]; then
+            built=$(echo "$row" | jq -c --arg s "$slug" '((.[0].built_slugs // []) + [$s]) | unique')
+          else
+            built=$(echo "$row" | jq -c '.[0].built_slugs // []')
+          fi
+          count=$(echo "$built" | jq 'length')
+          if [ "$count" -ge "$feeder_count" ]; then
+            status="done"; done_at_clause=",\"done_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+          else
+            status="in_progress"; done_at_clause=""
+          fi
+          curl -sf "${RETRY[@]}" -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
+            -d "{\"built_slugs\":$built,\"status\":\"$status\",\"error\":null$done_at_clause}"
+
+      - name: Mark failed (deploy or live-check never passed)
+        # Broader than "verify failed" -- also catches a deploy step failure
+        # (verify never even ran, steps.verify.outcome would be 'skipped').
+        if: steps.meta.outputs.present == 'true' && failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          wheel_id="${{ steps.meta.outputs.wheel_id }}"
+          code="${{ steps.verify.outputs.http_code }}"
+          reason="${code:-deploy step failed, see Action run log}"
+          curl -s --retry 4 --retry-delay 3 --retry-all-errors -w '\nHTTP=%{http_code}\n' -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
+            -d "{\"status\":\"failed\",\"error\":\"$reason\"}" || true

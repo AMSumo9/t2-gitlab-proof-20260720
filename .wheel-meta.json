@@ -1,0 +1,17 @@
+{
+  "wheel_id": "host-proof-20260720",
+  "slug": "t2-gitlab-proof-20260720",
+  "project": "t2-gitlab-proof-20260720",
+  "parent_t1_ref": "host-proof-parent",
+  "node_role": "feeder",
+  "money_target": "sumo9.com",
+  "primary_kw": "GitLab T2 host proof",
+  "intended_url": "https://sites-26.gitlab.io/t2-gitlab-proof-20260720/",
+  "links": [
+    {
+      "target_url": "https://sumo9.com/",
+      "anchor": "Visit Sumo",
+      "rel": "follow"
+    }
+  ]
+}
