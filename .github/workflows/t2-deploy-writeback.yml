@@ -380,8 +380,8 @@ jobs:
             PROJECT_ID="$(printf '%s' "$PROJECT_JSON" | jq -r '.id // empty')"
           fi
           [ -n "$PROJECT_ID" ] || { echo "::error::GitLab project create/lookup failed"; exit 1; }
-          curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_PAT" \
-            --data-urlencode "visibility=public" --data-urlencode "pages_access_level=public" \
+          curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_PAT" -H "Content-Type: application/json" \
+            --data '{"visibility":"public","pages_access_level":"public"}' \
             "$API/projects/$PROJECT_ID" >/dev/null
 
           STAGE="$(mktemp -d)"
