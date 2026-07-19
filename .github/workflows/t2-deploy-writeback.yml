@@ -385,7 +385,17 @@ jobs:
             "$API/projects/$PROJECT_ID" >/dev/null
 
           STAGE="$(mktemp -d)"
-          rsync -a --exclude='.git' --exclude='.github' ./ "$STAGE/"
+          REMOTE="https://oauth2:${GITLAB_PAT}@gitlab.com/${NAMESPACE}/${PROJECT}.git"
+          if git clone -q "$REMOTE" "$STAGE/repo" 2>/dev/null; then
+            STAGE="$STAGE/repo"
+            find "$STAGE" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          else
+            mkdir -p "$STAGE/repo"
+            STAGE="$STAGE/repo"
+            git -C "$STAGE" init -q -b main
+            git -C "$STAGE" remote add origin "$REMOTE"
+          fi
+          rsync -a --exclude='.git' --exclude='.github' "$GITHUB_WORKSPACE/" "$STAGE/"
           cat > "$STAGE/.gitlab-ci.yml" <<'YML'
           pages:
             stage: deploy
@@ -402,13 +412,11 @@ jobs:
             only: [main]
           YML
           cd "$STAGE"
-          git init -q -b main
           git config user.email "codex-t2@sitesau.local"
           git config user.name "codex-t2"
           git add -A
-          git commit -q --allow-empty -m "publish $PROJECT"
-          git remote add origin "https://oauth2:${GITLAB_PAT}@gitlab.com/${NAMESPACE}/${PROJECT}.git"
-          git push -q --force origin main
+          git commit -q -m "publish $PROJECT" || true
+          git push -q origin HEAD:main
 
           URL=""
           for _ in $(seq 1 20); do
