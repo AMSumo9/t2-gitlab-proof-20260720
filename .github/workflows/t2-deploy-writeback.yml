@@ -406,7 +406,7 @@ jobs:
           git config user.email "codex-t2@sitesau.local"
           git config user.name "codex-t2"
           git add -A
-          git commit -q -m "publish $PROJECT"
+          git commit -q --allow-empty -m "publish $PROJECT"
           git remote add origin "https://oauth2:${GITLAB_PAT}@gitlab.com/${NAMESPACE}/${PROJECT}.git"
           git push -q --force origin main
 
