@@ -381,7 +381,7 @@ jobs:
           fi
           [ -n "$PROJECT_ID" ] || { echo "::error::GitLab project create/lookup failed"; exit 1; }
           curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_PAT" -H "Content-Type: application/json" \
-            --data '{"visibility":"public","pages_access_level":"public"}' \
+            --data '{"visibility":"public"}' \
             "$API/projects/$PROJECT_ID" >/dev/null
 
           STAGE="$(mktemp -d)"
@@ -417,6 +417,9 @@ jobs:
             [ -n "$URL" ] && break
           done
           [ -n "$URL" ] || { echo "::error::GitLab Pages URL was not assigned"; exit 1; }
+          curl -sf -X PUT -H "PRIVATE-TOKEN: $GITLAB_PAT" -H "Content-Type: application/json" \
+            --data '{"visibility":"public","pages_access_level":"public"}' \
+            "$API/projects/$PROJECT_ID" >/dev/null
           echo "resolved_url=${URL%/}/" >> "$GITHUB_OUTPUT"
 
       - name: Publish into Firebase T2 path repository
