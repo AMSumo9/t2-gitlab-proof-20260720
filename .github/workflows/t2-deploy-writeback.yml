@@ -647,22 +647,26 @@ jobs:
 
           # 3. t2_build_queue: append feeder slugs to built_slugs, flip done only
           #    once feeder_count is met (structure may need multiple pushes).
-          row=$(curl -sf "${RETRY[@]}" "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
-          feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
-          node_role="${{ steps.meta.outputs.node_role }}"
-          if [ "$node_role" = "feeder" ]; then
-            built=$(echo "$row" | jq -c --arg s "$slug" '((.[0].built_slugs // []) + [$s]) | unique')
+          if [[ "$wheel_id" =~ ^[0-9]+$ ]]; then
+            row=$(curl -sf "${RETRY[@]}" "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
+            feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
+            node_role="${{ steps.meta.outputs.node_role }}"
+            if [ "$node_role" = "feeder" ]; then
+              built=$(echo "$row" | jq -c --arg s "$slug" '((.[0].built_slugs // []) + [$s]) | unique')
+            else
+              built=$(echo "$row" | jq -c '.[0].built_slugs // []')
+            fi
+            count=$(echo "$built" | jq 'length')
+            if [ "$count" -ge "$feeder_count" ]; then
+              status="done"; done_at_clause=",\"done_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            else
+              status="in_progress"; done_at_clause=""
+            fi
+            curl -sf "${RETRY[@]}" -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
+              -d "{\"built_slugs\":$built,\"status\":\"$status\",\"error\":null$done_at_clause}"
           else
-            built=$(echo "$row" | jq -c '.[0].built_slugs // []')
+            echo "Non-numeric proof wheel id '$wheel_id': DB property/link writeback proven; queue update skipped."
           fi
-          count=$(echo "$built" | jq 'length')
-          if [ "$count" -ge "$feeder_count" ]; then
-            status="done"; done_at_clause=",\"done_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-          else
-            status="in_progress"; done_at_clause=""
-          fi
-          curl -sf "${RETRY[@]}" -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
-            -d "{\"built_slugs\":$built,\"status\":\"$status\",\"error\":null$done_at_clause}"
 
       - name: Mark failed (deploy or live-check never passed)
         # Broader than "verify failed" -- also catches a deploy step failure
@@ -675,7 +679,9 @@ jobs:
           wheel_id="${{ steps.meta.outputs.wheel_id }}"
           code="${{ steps.verify.outputs.http_code }}"
           reason="${code:-deploy step failed, see Action run log}"
-          curl -s --retry 4 --retry-delay 3 --retry-all-errors -w '\nHTTP=%{http_code}\n' -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
-            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
-            -d "{\"status\":\"failed\",\"error\":\"$reason\"}" || true
+          if [[ "$wheel_id" =~ ^[0-9]+$ ]]; then
+            curl -s --retry 4 --retry-delay 3 --retry-all-errors -w '\nHTTP=%{http_code}\n' -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
+              -d "{\"status\":\"failed\",\"error\":\"$reason\"}" || true
+          fi
