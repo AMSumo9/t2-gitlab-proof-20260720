@@ -387,20 +387,20 @@ jobs:
           STAGE="$(mktemp -d)"
           rsync -a --exclude='.git' --exclude='.github' ./ "$STAGE/"
           cat > "$STAGE/.gitlab-ci.yml" <<'YML'
-pages:
-  stage: deploy
-  script:
-    - rm -rf public
-    - mkdir -p public
-    - |
-      find . -mindepth 1 -maxdepth 1 \
-        ! -name '.git' ! -name 'public' ! -name '.gitlab-ci.yml' \
-        -exec cp -a {} public/ \;
-    - rm -rf public/.git public/public
-  artifacts:
-    paths: [public]
-  only: [main]
-YML
+          pages:
+            stage: deploy
+            script:
+              - rm -rf public
+              - mkdir -p public
+              - |
+                find . -mindepth 1 -maxdepth 1 \
+                  ! -name '.git' ! -name 'public' ! -name '.gitlab-ci.yml' \
+                  -exec cp -a {} public/ \;
+              - rm -rf public/.git public/public
+            artifacts:
+              paths: [public]
+            only: [main]
+          YML
           cd "$STAGE"
           git init -q -b main
           git config user.email "codex-t2@sitesau.local"
