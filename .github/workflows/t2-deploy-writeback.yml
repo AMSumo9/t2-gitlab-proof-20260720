@@ -531,7 +531,6 @@ jobs:
                 direct_code="$(curl -sS -D /tmp/live-headers -o /tmp/live-body -w '%{http_code}' "$url")"
                 [ "$direct_code" = "200" ] || { echo "::error::Direct public URL returned $direct_code (redirect/auth not allowed)"; exit 1; }
                 ! grep -qiE '^x-robots-tag:.*noindex' /tmp/live-headers || { echo "::error::X-Robots-Tag blocks indexing"; exit 1; }
-                ! grep -qiE '<meta[^>]+name=["'"']robots["'"'][^>]+content=["'"'][^"'"']*noindex' /tmp/live-body || { echo "::error::meta robots blocks indexing"; exit 1; }
                 python3 - <<'PY'
           import json
           from html.parser import HTMLParser
@@ -542,17 +541,22 @@ jobs:
               def __init__(self):
                   super().__init__()
                   self.follow = set()
+                  self.noindex = False
 
               def handle_starttag(self, tag, attrs):
+                  values = {key.lower(): value or "" for key, value in attrs}
+                  if tag.lower() == "meta" and values.get("name", "").lower() == "robots":
+                      self.noindex = "noindex" in values.get("content", "").lower()
                   if tag.lower() != "a":
                       return
-                  values = {key.lower(): value or "" for key, value in attrs}
                   rel = {part.lower() for part in values.get("rel", "").split()}
                   if values.get("href") and "nofollow" not in rel:
                       self.follow.add(values["href"])
 
           parser = Links()
           parser.feed(open("/tmp/live-body", encoding="utf-8", errors="replace").read())
+          if parser.noindex:
+              raise SystemExit("meta robots blocks indexing")
           missing = sorted(expected - parser.follow)
           if missing:
               raise SystemExit(f"missing dofollow upward links: {missing}")
